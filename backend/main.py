@@ -1,20 +1,23 @@
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import os
 import re
 import json
 import logging
 import sys
+from datetime import datetime
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
+from pydantic import BaseModel
 import numpy as np
 from sentence_transformers import SentenceTransformer, util
 
 import crud
 from database import Base, engine, get_db
 from models import NoteRead, NoteCreate, NoteUpdate, Note
+from ai_processor import process_raw_note
 
 # Configure logging
 logging.basicConfig(
@@ -24,27 +27,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Create database tables
-Base.metadata.create_all(bind=engine)
+def _to_read(note: Note) -> Dict[str, Any]:
+    """Convert a Note model to a response dict"""
+    return {
+        "id": note.id,
+        "title": note.title,
+        "content": note.content,
+        "layer": note.layer,
+        "tags": note.tags.split(",") if note.tags else [],
+        "created_at": note.created_at.isoformat(),
+        "updated_at": note.updated_at.isoformat(),
+        "links": [n.id for n in note.links] if hasattr(note, 'links') and note.links else []
+    }
 
 # Initialize the SentenceTransformer model
 LOCAL_MODEL_PATH = os.environ.get("MINDMESH_LOCAL_MODEL_PATH")
 _model: Optional[SentenceTransformer] = None
 
-def get_model() -> SentenceTransformer:
-    global _model
-    try:
-        if _model is None:
-            logger.info("Initializing SentenceTransformer model...")
-            model_path = LOCAL_MODEL_PATH or "sentence-transformers/all-MiniLM-L6-v2"
-            logger.info(f"Using model path: {model_path}")
-            _model = SentenceTransformer(model_path)
-            logger.info("Model initialized successfully")
-        return _model
-    except Exception as e:
-        logger.error(f"Error initializing model: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to initialize search model")
+# Create database tables
+Base.metadata.create_all(bind=engine)
 
+# Create FastAPI app
 app = FastAPI(title="MindMesh Prototype API")
 
 # Configure CORS
@@ -63,6 +66,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def get_model() -> SentenceTransformer:
+    global _model
+    try:
+        if _model is None:
+            logger.info("Initializing SentenceTransformer model...")
+            model_path = LOCAL_MODEL_PATH or "sentence-transformers/all-MiniLM-L6-v2"
+            logger.info(f"Using model path: {model_path}")
+            _model = SentenceTransformer(model_path)
+            logger.info("Model initialized successfully")
+        return _model
+    except Exception as e:
+        logger.error(f"Error initializing model: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to initialize search model")
+
+# Import initial data loader
+from initial_data import create_initial_notes
+
+# Initialize the model and create initial notes
+def init_data():
+    try:
+        model = get_model()
+        create_initial_notes(model)
+    except Exception as e:
+        logger.error(f"Error initializing data: {str(e)}")
+
+@app.on_event("startup")
+async def startup_event():
+    init_data()
+
 # Global error handler
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -73,6 +105,9 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
+# NOTE: the real classify_layer implementation is declared once below; keep only that one.
+
+# Handle layer classification for notes
 def classify_layer(title: str, content: str | None) -> str:
     text = f"{title} \n {content or ''}".lower()
     emotional = ["feel", "love", "fear", "anxious", "happy", "sad", "mood", "emotion"]
@@ -85,15 +120,6 @@ def classify_layer(title: str, content: str | None) -> str:
     if any(k in text for k in factual):
         return "factual"
     return "factual"
-
-# Allow local dev on Vite default port
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 @app.get("/notes/search", response_model=List[NoteRead], tags=["search"])
@@ -143,42 +169,70 @@ async def search_notes(q: str = Query(..., min_length=1), db: Session = Depends(
         raise HTTPException(status_code=500, detail="Search operation failed")
 
 
+@app.post("/notes", response_model=NoteRead)
+async def create_note(note_in: NoteCreate, db: Session = Depends(get_db)):
+    try:
+        logger.info(f"Creating note: {note_in.title}")
+        
+        # Generate embedding for the note
+        model = get_model()
+        text = f"{note_in.title}\n{note_in.content or ''}"
+        embedding = model.encode(text, normalize_embeddings=True).tolist()
+        
+        # Classify the note's layer
+        layer = classify_layer(note_in.title, note_in.content)
+        note_in.layer = layer
+        
+        # Create the note
+        note = crud.create_note(db, note_in, embedding)
+        return _to_read(note)
+    except Exception as e:
+        logger.error(f"Failed to create note: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to create note")
+
+class RawNoteInput(BaseModel):
+    raw_content: str
+
+@app.post("/notes/process-raw", response_model=NoteRead)
+async def process_and_create_note(note_input: RawNoteInput, db: Session = Depends(get_db)):
+    """Process raw note content and create a structured note with AI-generated metadata."""
+    try:
+        if not note_input.raw_content.strip():
+            raise HTTPException(status_code=400, detail="Note content cannot be empty")
+            
+        logger.info("Processing raw note")
+        # Get existing notes for finding connections
+        existing_notes = [
+            {
+                "id": note.id,
+                "embedding": note.embedding
+            }
+            for note in crud.list_notes(db)
+        ]
+        
+        # Process the raw content
+        model = get_model()
+        processed = process_raw_note(note_input.raw_content, existing_notes, model)
+        
+        # Add layer classification
+        processed["layer"] = classify_layer(processed["title"], processed["content"])
+        
+        # Create note using processed data
+        note_in = NoteCreate(**processed)
+        note = crud.create_note(db, note_in, processed["embedding"])
+        
+        return _to_read(note)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to process raw note: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
 
-
-@app.post("/notes", response_model=NoteRead)
-def create_note(note_in: NoteCreate, db: Session = Depends(get_db)):
-    text = f"{note_in.title}\n\n{note_in.content or ''}"
-    model = get_model()
-    vec = model.encode(text, normalize_embeddings=True).tolist()
-    note = crud.create_note(db, note_in, embedding=vec)
-    note.layer = classify_layer(note.title, note.content)
-    db.add(note)
-    db.commit()
-    db.refresh(note)
-    return _to_read(note)
-
-
-@app.get("/notes/search", response_model=List[NoteRead])
-def search_notes(q: str = Query(..., min_length=1), db: Session = Depends(get_db)):
-    model = get_model()
-    query_vec = model.encode(q, normalize_embeddings=True)
-    notes = crud.list_notes(db)
-    scored: list[tuple[float, Note]] = []
-    for n in notes:
-        if not n.embedding:
-            continue
-        try:
-            vec = np.array(json.loads(n.embedding), dtype=np.float32)
-        except Exception:
-            continue
-        score = float(np.dot(query_vec, vec) / (np.linalg.norm(query_vec) * (np.linalg.norm(vec) or 1.0)))
-        scored.append((score, n))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    top = [n for _, n in scored[:3]]
-    return [_to_read(n) for n in top]
 
 @app.get("/notes", response_model=List[NoteRead])
 def list_notes(db: Session = Depends(get_db)):
@@ -186,24 +240,7 @@ def list_notes(db: Session = Depends(get_db)):
     return [_to_read(n) for n in notes]
 
 
-@app.get("/notes/search", response_model=List[NoteRead])
-def search_notes(q: str = Query(..., min_length=1), db: Session = Depends(get_db)):
-    model = get_model()
-    query_vec = model.encode(q, normalize_embeddings=True)
-    notes = crud.list_notes(db)
-    scored: list[tuple[float, Note]] = []
-    for n in notes:
-        if not n.embedding:
-            continue
-        try:
-            vec = np.array(json.loads(n.embedding), dtype=np.float32)
-        except Exception:
-            continue
-        score = float(np.dot(query_vec, vec) / (np.linalg.norm(query_vec) * (np.linalg.norm(vec) or 1.0)))
-        scored.append((score, n))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    top = [n for _, n in scored[:3]]
-    return [_to_read(n) for n in top]
+# Removed broken duplicate endpoint
 
 
 @app.get("/notes/{note_id}", response_model=NoteRead)
@@ -300,17 +337,7 @@ def get_nudges(db: Session = Depends(get_db), layer: Optional[str] = Query(None,
     return [_to_read(n) for n in notes[:3]]
 
 
-def _to_read(note: Note) -> NoteRead:
-    return NoteRead(
-        id=note.id,
-        title=note.title,
-        content=note.content,
-        layer=note.layer,
-        created_at=note.created_at,
-        updated_at=note.updated_at,
-        links=[ln.id for ln in note.links] if note.links else [],
-        tags=note.tags,
-    )
+# This function has been moved to the top of the file
 
 
 

@@ -52,6 +52,7 @@ class NoteCreate(BaseModel):
     content: Optional[str] = None
     link_ids: list[int] = []
     tags: list[str] = []
+    layer: Optional[str] = None
 
 
 class NoteUpdate(BaseModel):
